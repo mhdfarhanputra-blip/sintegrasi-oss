@@ -1,0 +1,179 @@
+import { NextResponse } from 'next/server'
+import { createServerSupabase } from '@/lib/supabase/server'
+import { getCurrentUser } from '@/lib/getCurrentUser'
+import { safeHttpUrl } from '@/lib/safeUrl'
+import { internalApiError,  mapSupabaseError } from '@/lib/apiError'
+import { notifyUsersByRole } from '@/lib/notify'
+import { cleanText, cleanDate, cleanYear, cleanInt } from '@/lib/validation'
+
+export const runtime = 'nodejs'
+
+const MAX_TEXT = 1000
+
+const DIPA_NOTIF_ROLES = ['Admin', 'Bendahara', 'Perencanaan']
+const DIPA_NOTIF_LINK = '/dipa'
+const DIPA_TYPE_BARU = 'dipa_baru'
+const DIPA_TYPE_UPDATE = 'dipa_update'
+const DIPA_TITLE_BARU = 'Dokumen DIPA/RKA-KL baru'
+const DIPA_TITLE_UPDATE = 'Dokumen DIPA/RKA-KL diperbarui'
+
+/**
+ * Menyusun pesan notifikasi DIPA tanpa string berulang.
+ */
+function buildDipaMessage(revisiKe: number, tahun: number, isUpdate: boolean): string {
+  if (isUpdate) return `Revisi ke-${revisiKe} TA ${tahun} diperbarui.`
+  if (revisiKe === 0) return `Dokumen awal TA ${tahun} telah diunggah.`
+  return `Revisi ke-${revisiKe} TA ${tahun} telah diunggah.`
+}
+
+/**
+ * Picu penyusunan folder revisi di Google Drive (best-effort).
+ *
+ * Revisi yang diunggah harus langsung mendapat folder
+ * DIPA/{tahun}/Revisi N/ berisi "DIPA - Revisi N.pdf" & "RKAKL - Revisi N.pdf".
+ * Dulu penyusunan hanya berjalan manual/cron harian, sehingga revisi baru
+ * terlihat "tanpa folder" sampai keesokan hari.
+ *
+ * Kegagalan pemicu TIDAK boleh menggagalkan penyimpanan data.
+ */
+async function picuSusunRevisi(revisiKe: number | null | undefined): Promise<void> {
+  const url = process.env.REVISI_TRIGGER_URL
+  const token = process.env.REVISI_TRIGGER_TOKEN
+  if (!url || !token) return
+  try {
+    await fetch(`${url.replace(/\/$/, '')}/revisi/susun`, {
+      method: 'POST',
+      headers: { 'X-Trigger-Token': token },
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch {
+    // best-effort: biarkan cron harian yang menyusulkan
+  }
+}
+
+/**
+ * Kirim notifikasi DIPA secara best-effort; kegagalan tidak menggagalkan response utama.
+ */
+async function notifyDipa(revisiKe: number, tahun: number, isUpdate: boolean): Promise<void> {
+  try {
+    await notifyUsersByRole(DIPA_NOTIF_ROLES, {
+      type: isUpdate ? DIPA_TYPE_UPDATE : DIPA_TYPE_BARU,
+      title: isUpdate ? DIPA_TITLE_UPDATE : DIPA_TITLE_BARU,
+      message: buildDipaMessage(revisiKe, tahun, isUpdate),
+      link: DIPA_NOTIF_LINK,
+    })
+  } catch {
+    // best-effort
+  }
+}
+
+interface DipaPayload {
+  id?: string
+  revisi_ke?: number | null
+  tanggal_revisi?: string | null
+  tahun_anggaran?: number | null
+  link_dipa?: string | null
+  link_rkakl?: string | null
+  keterangan_revisi?: string | null
+}
+
+function normalizePayload(body: DipaPayload) {
+  const linkDipa = safeHttpUrl(body.link_dipa)
+  const linkRkakl = safeHttpUrl(body.link_rkakl)
+
+  if (!linkDipa && !linkRkakl) {
+    return { error: 'Minimal satu dokumen DIPA atau RKA-KL wajib diunggah/ditautkan' }
+  }
+
+  return {
+    data: {
+      revisi_ke: cleanInt(body.revisi_ke, { min: 0, max: 999 }) ?? 0,
+      tanggal_revisi: cleanDate(body.tanggal_revisi),
+      tahun_anggaran: cleanYear(body.tahun_anggaran),
+      link_dipa: linkDipa,
+      link_rkakl: linkRkakl,
+      keterangan_revisi: cleanText(body.keterangan_revisi, MAX_TEXT),
+    },
+  }
+}
+
+async function requireAdmin() {
+  const me = await getCurrentUser()
+  if (!me) return { error: 'Belum masuk', status: 401 as const }
+  if (me.status !== 'Aktif' || me.role !== 'Admin') {
+    return { error: 'Hanya Admin aktif yang boleh mengelola DIPA/RKA-KL', status: 403 as const }
+  }
+  return { me }
+}
+
+export async function POST(request: Request) {
+  try {
+    const ctx = await requireAdmin()
+    if ('error' in ctx) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
+
+    const normalized = normalizePayload((await request.json()) as DipaPayload)
+    if ('error' in normalized) return NextResponse.json({ error: normalized.error }, { status: 400 })
+
+    const supabase = await createServerSupabase()
+    const { data, error } = await supabase
+      .from('dokumen_dipa')
+      .insert({ ...normalized.data, uploaded_by: ctx.me.id })
+      .select('*')
+      .single()
+
+    if (error) { const mapped = mapSupabaseError('route', error); if (mapped) return mapped; throw error }
+    await notifyDipa(normalized.data.revisi_ke, normalized.data.tahun_anggaran, false)
+    await picuSusunRevisi(normalized.data.revisi_ke)
+    return NextResponse.json({ data }, { status: 201 })
+  } catch (err) {
+    return internalApiError('DIPA POST', err)
+  }
+}
+
+export async function PATCH(request: Request) {
+  try {
+    const ctx = await requireAdmin()
+    if ('error' in ctx) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
+
+    const body = (await request.json()) as DipaPayload
+    const id = cleanText(body.id, 80)
+    if (!id) return NextResponse.json({ error: 'ID dokumen wajib diisi' }, { status: 400 })
+
+    const normalized = normalizePayload(body)
+    if ('error' in normalized) return NextResponse.json({ error: normalized.error }, { status: 400 })
+
+    const supabase = await createServerSupabase()
+    const { data, error } = await supabase
+      .from('dokumen_dipa')
+      .update(normalized.data)
+      .eq('id', id)
+      .select('*')
+      .single()
+
+    if (error) { const mapped = mapSupabaseError('route', error); if (mapped) return mapped; throw error }
+    await notifyDipa(normalized.data.revisi_ke, normalized.data.tahun_anggaran, true)
+    await picuSusunRevisi(normalized.data.revisi_ke)
+    return NextResponse.json({ data })
+  } catch (err) {
+    return internalApiError('DIPA PATCH', err)
+  }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const ctx = await requireAdmin()
+    if ('error' in ctx) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
+
+    const { searchParams } = new URL(request.url)
+    const id = cleanText(searchParams.get('id'), 80)
+    if (!id) return NextResponse.json({ error: 'ID dokumen wajib diisi' }, { status: 400 })
+
+    const supabase = await createServerSupabase()
+    const { error } = await supabase.from('dokumen_dipa').delete().eq('id', id)
+    if (error) { const mapped = mapSupabaseError('route', error); if (mapped) return mapped; throw error }
+
+    return NextResponse.json({ ok: true })
+  } catch (err) {
+    return internalApiError('DIPA DELETE', err)
+  }
+}
